@@ -15,6 +15,7 @@ int currentStep(0);
 int sensVal[4];
 float ist[4];
 unsigned long previous_time(0);
+unsigned long lastRecord(0);
 int lastMode(-1);
 const int stepDuration = 800; // ms per step transition during playback
 
@@ -23,12 +24,12 @@ float easeInOut(float t) {
     return -(cos(PI * t) - 1.0f) / 2.0f;
 }
 
-// fcn to smoothly move servos from one recorded position to the next over duration_ms
+//fcn to smoothly move servos from one recorded position to the next over duration_ms
 void smoothMove(int f0, int t0, int f1, int t1, int f2, int t2, int f3, int t3, int duration_ms) {
     const int steps = 50;
     int stepDelay = duration_ms / steps;
     for (int i = 0; i <= steps; i++) {
-        // check for mode change midmove so user can interrupt
+        //check for mode change midmove so user can interrupt
         if (Serial.available() > 0) break;
         float ease = easeInOut((float)i / steps);
         servo1.writeMicroseconds(f0 + ease * (t0 - f0));
@@ -39,7 +40,7 @@ void smoothMove(int f0, int t0, int f1, int t1, int f2, int t2, int f3, int t3, 
     }
 }
 
-// function to average the analogRead from each potentiometer to reduce noise, thus reducing jittering
+//function to average the analogRead from each potentiometer to reduce noise, thus reducing jittering
 unsigned int averageFcn(int pin) {
     unsigned int count(0);
     for(unsigned int i(0); i < 30; i++){
@@ -57,6 +58,8 @@ void readPot() {
     sensVal[3] = averageFcn(A1);
 }
 
+
+//mapping the manual potentiometer values, 0 - 650 calibrated for my setup, to 600 - 2400 for microsecond movements
 void mapping() {
     ist[0] = map(sensVal[0], 0, 650, 600, 2400);
     ist[1] = map(sensVal[1], 0, 650, 600, 2400);
@@ -64,6 +67,7 @@ void mapping() {
     ist[3] = map(sensVal[3], 0, 650, 600, 2400);
 }
 
+//function to merge all servo movements into 1 fcn
 void move_servo() {
     servo1.writeMicroseconds(ist[0]);
     servo2.writeMicroseconds(ist[1]);
@@ -97,7 +101,7 @@ void playBack() {
         return;
     }
 
-    // on first step, snap directly to starting position then begin smooth transitions
+    //on first step, snap directly to starting position then begin smooth transitions
     if (currentStep == 0) {
         servo1.writeMicroseconds(joint0[0]);
         servo2.writeMicroseconds(joint1[0]);
@@ -127,46 +131,66 @@ void playBack() {
     }
 }
 
-//fcn to handle menu options for firmware
+//prints the command menu to the serial monitor
 void printHelp() {
     Serial.println("--- Commands ---");
     Serial.println("  0  : Normal mode (potentiometer control)");
     Serial.println("  1  : Record mode (position arm, send 'r' to save each step)");
     Serial.println("  2  : Playback mode (smooth replay of recorded steps)");
+    Serial.println("  3  : Gesture mode (python controls servos)");
     Serial.println("  r  : Record current position (record mode only)");
     Serial.println("  h  : Show this help");
     Serial.println("----------------");
 }
 
-// fcn to update the mode variable, dictating what mode the claw is in and provide a help menu for the serial monitor controls
+
+//reads and processes all incoming serial commands (mode switches, record trigger, gesture S commands)
 void handleButtons() {
-    if (Serial.available() > 0) {
+    while (Serial.available() > 0) {
         char cmd = Serial.read();
-        if (cmd == '0') {
-            mode = 0;
-        } else if (cmd == '1') {
-            mode = 1;
-            stepCount = 0;
-        } else if (cmd == '2') {
-            mode = 2;
-            currentStep = 0;
-        } else if (cmd == 'r') {
-            recordStep();
-        } else if (cmd == 'h') {
-            printHelp();
+        if (cmd == '\r' || cmd == '\n') continue;
+
+        if (cmd == '0') { mode = 0; }
+        else if (cmd == '1') { mode = 1; stepCount = 0; }
+        else if (cmd == '2') { mode = 2; currentStep = 0; }
+        else if (cmd == '3') { mode = 3; }
+        else if (cmd == 'S') {
+            char buf[24];
+            int len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+            if (mode == 3) {
+                buf[len] = '\0';
+                int s1, s2, s3, s4;
+                if (sscanf(buf, "%d %d %d %d", &s1, &s2, &s3, &s4) == 4) {
+                    servo1.writeMicroseconds(s1);
+                    servo2.writeMicroseconds(s2);
+                    servo3.writeMicroseconds(s3);
+                    servo4.writeMicroseconds(s4);
+                }
+            }
         }
+        else if (cmd == 'r' && mode == 1 && millis() - lastRecord > 300) {
+            readPot();
+            mapping();
+            lastRecord = millis();
+            recordStep();
+        }
+        else if (cmd == 'h') { printHelp(); }
     }
 }
 
+//when an option is selected accurately state the correct mode in the serial monitor
 void printModeChange() {
     if (mode != lastMode) {
         lastMode = mode;
         if (mode == 0) Serial.println("[MODE] Normal — move arm with potentiometers.");
         if (mode == 1) Serial.println("[MODE] Record — position arm and send 'r' to save each step.");
         if (mode == 2) Serial.println("[MODE] Playback — smooth replay of recorded steps. Send '0' to stop.");
+        if (mode == 3) Serial.println("[MODE] Gesture — python is controlling servos.");
     }
 }
 
+
+//attaching all servos based off of my circuit, can change on your wiring
 void setup() {
     servo1.attach(5);
     servo2.attach(11);
@@ -174,6 +198,7 @@ void setup() {
     servo4.attach(6);
     pinMode(13, OUTPUT);
     Serial.begin(9600);
+    Serial.setTimeout(200);
     analogReference(DEFAULT);
 
     //smooth opening sequence
@@ -190,7 +215,7 @@ void loop() {
     printModeChange();
     unsigned long current_time(millis());
 
-    // creating cases for 3 different modes: 0 = regular, 1 = record, 2 = playback
+    // potentiometer polling runs in modes 0 and 1; mode 2 runs playback; mode 3 is handled entirely in handleButtons
     if (mode == 0 || mode == 1) {
         if (current_time - previous_time >= 25) {
             previous_time = current_time;

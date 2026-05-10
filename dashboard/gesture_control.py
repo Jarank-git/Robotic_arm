@@ -1,130 +1,84 @@
-import cv2
-import mediapipe as mp
 import serial
 import time
-import math
+import cv2
+import mediapipe as mp
 
-# serial connection to arduino — sleep(2) waits for arduino to reboot after connecting
-ser = serial.Serial('COM3', 9600, timeout=1)
+port = "COM3"
+baud = 9600
+
+#neutral position for gesture control saved in array for each servo 1 - 4
+positions = [1500, 1500, 1500,1500 ]
+#keep track of directions 1 = rotating clockwise, -1 = rotating anti-clockwise
+directions = [1, 1, 1, 1]
+#how much to move each motor by, ensuring smooth movement
+step = 20
+min_Pos = 600
+max_Pos = 2400
+
+# let DTR reset happen naturally (same approach as the working version),
+# then wait for Arduino to finish booting before sending anything
+arm = serial.Serial(port, baud, timeout=1)
 time.sleep(2)
+arm.reset_input_buffer()
+arm.write(b'3')
+arm.flush()
+time.sleep(0.3)
+response = arm.read_all().decode('utf-8', errors='ignore')
+if '[MODE] Gesture' in response:
+    print("Gesture mode confirmed!")
+else:
+    print(f"WARNING: mode 3 not confirmed. Got: {response!r}")
 
-# mediapipe and webcam setup
+#limit # of hands to 1, and setup video
+mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
-cap      = cv2.VideoCapture(0)
+hands = mp_hands.Hands(max_num_hands=1)
+cap = cv2.VideoCapture(0)
 
-fist_start = None
-gesture    = ""
-servo1     = 1500
-servo2     = 1500
-servo4     = 1500
+tip_ids = [4, 8, 12, 16, 20]
 
+while True:
+    ret,frame = cap.read()
+    if not ret:
+        break
+    #reflect the camera
+    frame = cv2.flip(frame, 1)
+    #openCV gives bgr, mediapipe requires rgb convert
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    #result of the analysis through mediapipeline
+    result = hands.process(rgb)
 
-#fcn to scale a value from one range to another, same as arduino's map()
-def map_value(value, in_min, in_max, out_min, out_max):
-    # clamp input to avoid out of range values
-    value = max(in_min, min(in_max, value))
-    return int((value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+    fingers_up = 0
 
+    #check if a hand is visible then from there if it is create the landmarks
+    if result.multi_hand_landmarks:
+        #draw the 21 hand landmarks and skeleton connections onto the frame
+        for hand_landmarks in result.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        landmarks = result.multi_hand_landmarks[0].landmark
+        for i in range(1, 5):
+            #fingertip y < knuckle y means the finger is extended (y increases downward in image coordinates)
+            if landmarks[tip_ids[i]].y < landmarks[tip_ids[i] - 2].y:
+                fingers_up +=1
 
-# fcn to count how many fingers are extended using tip vs knuckle y positions
-def count_fingers(landmarks):
-    # fingertip landmark ids
-    tips  = [8, 12, 16, 20]
-    # base knuckle landmark ids
-    bases = [6, 10, 14, 18]
-
-    count = 0
-    for tip, base in zip(tips, bases):
-        # tip above knuckle = extended
-        if landmarks[tip].y < landmarks[base].y:
-            count += 1
-
-    #thumb uses horizontal position instead of vertical
-    if landmarks[4].x > landmarks[3].x:
-        count += 1
-
-    return count
+        if fingers_up > 0:
+            #fingers_up - 1 converts the count to a 0-based index (1 finger → servo 0, 2 → servo 1, etc.)
+            idx = fingers_up - 1
+            positions[idx] += step * directions[idx]
 
 
-#fcn to get the distance between two landmarks, used for gripper span
-def landmark_distance(landmarks, id1, id2):
-    p1 = landmarks[id1]
-    p2 = landmarks[id2]
-    return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+            if positions[idx] >= max_Pos or positions[idx] <= min_Pos:
+                directions[idx] *= -1
+            positions[idx] = max(min_Pos, min(max_Pos, positions[idx]))
 
+    command = f"S {positions[0]} {positions[1]} {positions[2]} {positions[3]}\n"
+    arm.write(command.encode())
+    arm.flush()
 
-with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7) as hands:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    cv2.imshow("Gesture Control", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        # mirror so movement feels natural
-        frame = cv2.flip(frame, 1)
-
-        # mediapipe requires rgb, opencv gives bgr
-        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
-
-        if result.multi_hand_landmarks:
-            for hand_landmarks in result.multi_hand_landmarks:
-
-                #draw hand skeleton on the camera feed
-                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-                lm = hand_landmarks.landmark
-
-                # mapping wrist x to base servo — left/right
-                servo1 = map_value(lm[0].x, 0.0, 1.0, 600, 2400)
-                # mapping wrist y to shoulder servo — up/down
-                servo2 = map_value(lm[0].y, 0.0, 1.0, 600, 2400)
-
-                #mapping thumb to pinky span to gripper servo
-                span   = landmark_distance(lm, 4, 20)
-                servo4 = map_value(span, 0.1, 0.5, 600, 2400)
-
-                # creating cases for 3 gestures: open palm = live, fist = record, peace = playback
-                fingers = count_fingers(lm)
-
-                if fingers == 5:
-                    gesture    = "live control"
-                    fist_start = None
-                    ser.write(b'0')
-
-                elif fingers == 0:
-                    # fist held for 1 second triggers a record step
-                    gesture = "fist — hold 1s to record"
-                    if fist_start is None:
-                        fist_start = time.time()
-                    elif time.time() - fist_start > 1.0:
-                        gesture    = "recording step"
-                        fist_start = None
-                        ser.write(b'r')
-
-                elif fingers == 2:
-                    gesture    = "playback"
-                    fist_start = None
-                    ser.write(b'2')
-
-                else:
-                    gesture    = f"{fingers} fingers"
-                    fist_start = None
-
-        #indication of current gesture and servo values for the user
-        cv2.putText(frame, f"gesture: {gesture}", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"s1:{servo1}  s2:{servo2}  s4:{servo4}", (10, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, "q to quit", (10, frame.shape[0] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
-
-        cv2.imshow("robotic arm control", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-#cleanup on exit
 cap.release()
 cv2.destroyAllWindows()
-ser.close()
+arm.close()
